@@ -8,7 +8,7 @@ let tf: typeof tensorflow;
 /**
  * Serializable model data that can be saved to JSON.
  */
-interface SerializedModel {
+export interface SerializedModel {
   /** Model configuration options */
   config: {
     epoch: number;
@@ -37,7 +37,7 @@ interface SerializedModel {
 /**
  * Represents an interaction between a user and an entity.
  */
-interface Interaction {
+export interface Interaction {
   /** The unique identifier of the user */
   user: Id;
   /** The unique identifier of the entity */
@@ -49,7 +49,7 @@ interface Interaction {
 /**
  * Configuration options for the recommendation system.
  */
-interface RecommendationOptions {
+export interface RecommendationOptions {
   /** Number of training epochs (default: 5) */
   epoch?: number;
   /** Size of the embedding vectors (default: 16) */
