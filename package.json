@@ -1,6 +1,6 @@
 {
   "name": "recommendtf",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "TensorFlow.js collaborative filtering for small Node.js applications",
   "main": "dist/index.js",
   "type": "commonjs",
