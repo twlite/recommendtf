@@ -285,7 +285,7 @@ export class Recommendation {
               tf.mean(tf.square(users)),
               tf.mean(tf.square(entities))
             ));
-            return tf.add(error, penalty);
+            return tf.add(error, penalty) as tensorflow.Scalar;
           }), false, [this.userEmbeddings, this.entityEmbeddings]);
         } finally {
           userTensor.dispose();
