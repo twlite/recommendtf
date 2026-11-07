@@ -40,6 +40,27 @@ function requireReleaseVersion(version) {
   return result;
 }
 
+export function authorizeReleaseAttempt(version, context = process.env) {
+  const release = detectRelease({
+    eventName: context.GITHUB_EVENT_NAME,
+    branch: context.GITHUB_REF_NAME,
+    repository: context.GITHUB_REPOSITORY,
+    actorId: context.GITHUB_ACTOR_ID,
+    triggeringActor: context.GITHUB_TRIGGERING_ACTOR,
+    subject: subjectFromHead(),
+  });
+  if (!release || release.version !== version || !context.GITHUB_SHA) {
+    throw new Error('This release attempt is not authorized for the current commit');
+  }
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: root, encoding: 'utf8',
+  }).trim();
+  if (commit !== context.GITHUB_SHA) {
+    throw new Error('Checked out commit differs from the release workflow SHA');
+  }
+  return release;
+}
+
 function subjectFromHead() {
   return execFileSync('git', ['log', '-1', '--format=%s'], {
     cwd: root, encoding: 'utf8',
@@ -187,6 +208,7 @@ async function main() {
 
   if (command === 'publish') {
     const { version, tag } = requireReleaseVersion(process.env.RELEASE_VERSION);
+    authorizeReleaseAttempt(version);
     if (tag !== process.env.NPM_TAG) throw new Error('Release tag mismatch');
     await publish(version, tag, args[0]);
     return;
@@ -194,12 +216,7 @@ async function main() {
 
   if (command === 'github-release') {
     const { version, prerelease } = requireReleaseVersion(process.env.RELEASE_VERSION);
-    if (process.env.GITHUB_REPOSITORY !== OFFICIAL_REPOSITORY ||
-      process.env.GITHUB_ACTOR_ID !== RELEASE_ACTOR_ID ||
-      process.env.GITHUB_TRIGGERING_ACTOR !== 'twlite' ||
-      process.env.GITHUB_REF_NAME !== 'main') {
-      throw new Error('Unauthorized release context');
-    }
+    authorizeReleaseAttempt(version);
     releaseOnGitHub(version, prerelease);
     return;
   }
