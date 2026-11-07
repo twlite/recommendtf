@@ -5,68 +5,83 @@ import { loadTensorflow } from './load-tensorflow';
 
 let tf: typeof tensorflow;
 
-/**
- * Serializable model data that can be saved to JSON.
- */
+export type FeedbackMode = 'explicit' | 'implicit';
+
+export interface Interaction {
+  user: Id;
+  entity: Id;
+  /** Explicit score, or 0/1 in implicit mode. Defaults to 1. */
+  rating?: number;
+}
+
+export interface RecommendationOptions {
+  epoch?: number;
+  embeddingSize?: number;
+  learningRate?: number;
+  batchSize?: number;
+  regularization?: number;
+  /** Use ratings (explicit) or binary interactions with sampled negatives (implicit). */
+  feedback?: FeedbackMode;
+  /** Number of unobserved items sampled per positive implicit interaction. */
+  negativeSamples?: number;
+  storage?: StorageStrategy;
+  /** Kept for compatibility. TensorFlow.js backend selection is not changed by this option. */
+  disableIsNode?: boolean;
+}
+
+export interface RecommendationQueryOptions {
+  /** Exclude previously observed user/entity pairs. Defaults to true for getEntities. */
+  excludeSeen?: boolean;
+  /** Additional IDs to exclude. */
+  exclude?: Iterable<Id>;
+  /** Behavior when the requested user is unknown. Defaults to popular. */
+  coldStart?: 'popular' | 'empty';
+}
+
 export interface SerializedModel {
-  /** Model configuration options */
   config: {
     epoch: number;
     embeddingSize: number;
     learningRate: number;
     batchSize: number;
+    regularization?: number;
+    feedback?: FeedbackMode;
+    negativeSamples?: number;
   };
-  /** User embeddings as a 2D array */
   userEmbeddings: number[][];
-  /** Entity embeddings as a 2D array */
   entityEmbeddings: number[][];
-  /** User ID to index mapping */
   userMap: Array<[Id, number]>;
-  /** Entity ID to index mapping */
   entityMap: Array<[Id, number]>;
-  /** Reverse user mapping (index to ID) */
   reverseUserMap: Id[];
-  /** Reverse entity mapping (index to ID) */
   reverseEntityMap: Id[];
-  /** Whether the model has been initialized */
+  /** Added in v2; legacy exports are still accepted. */
+  interactions?: Array<[Id, Id, number]>;
   initialized: boolean;
-  /** Version for compatibility checking */
   version: string;
 }
 
-/**
- * Represents an interaction between a user and an entity.
- */
-export interface Interaction {
-  /** The unique identifier of the user */
-  user: Id;
-  /** The unique identifier of the entity */
-  entity: Id;
-  /** Optional rating for the interaction (defaults to 1 if not provided) */
-  rating?: number;
+function positiveInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(name + ' must be a positive integer');
+  }
+  return value;
+}
+
+function validId(id: unknown): id is Id {
+  return typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id));
+}
+
+function validateMatrix(values: unknown, rows: number, columns: number, label: string): asserts values is number[][] {
+  if (!Array.isArray(values) || values.length !== rows ||
+    values.some((row) => !Array.isArray(row) || row.length !== columns ||
+      row.some((value) => typeof value !== 'number' || !Number.isFinite(value)))) {
+    throw new Error('Invalid ' + label + ' in serialized model');
+  }
 }
 
 /**
- * Configuration options for the recommendation system.
- */
-export interface RecommendationOptions {
-  /** Number of training epochs (default: 5) */
-  epoch?: number;
-  /** Size of the embedding vectors (default: 16) */
-  embeddingSize?: number;
-  /** Learning rate for the optimizer (default: 0.05) */
-  learningRate?: number;
-  /** Storage strategy for managing user and entity mappings (default: InMemoryStorage) */
-  storage?: StorageStrategy;
-  /** Batch size for processing data in chunks (default: 1000) */
-  batchSize?: number;
-  /** Whether to disable IS_NODE env (default: false) */
-  disableIsNode?: boolean;
-}
-
-/**
- * A collaborative filtering recommendation system using TensorFlow.js.
- * Uses matrix factorization with embeddings to learn user and entity representations.
+ * Small-scale matrix-factorization recommender. The instance serializes reads and writes,
+ * so training, resizing, export, and inference cannot race with one another.
  */
 export class Recommendation {
   public storage: StorageStrategy;
@@ -74,412 +89,433 @@ export class Recommendation {
   public entityEmbeddings!: tensorflow.Variable;
   public optimizer: tensorflow.Optimizer;
 
-  private embeddingSize: number;
-  private learningRate: number;
-  private epoch: number;
-  private batchSize: number;
+  private readonly embeddingSize: number;
+  private readonly learningRate: number;
+  private readonly epoch: number;
+  private readonly batchSize: number;
+  private readonly regularization: number;
+  private readonly feedback: FeedbackMode;
+  private readonly negativeSamples: number;
+  private readonly history = new Map<Id, Map<Id, number>>();
+  private operations: Promise<void> = Promise.resolve();
+  private closed = false;
   private _initialized = false;
 
-  /**
-   * Creates a new recommendation system instance.
-   * @param options - Configuration options for the recommendation system
-   */
-  public constructor(options: RecommendationOptions = {}) {
-    this.epoch = options.epoch ?? 5;
-    this.embeddingSize = options.embeddingSize ?? 16;
-    this.learningRate = options.learningRate ?? 0.05;
-    this.batchSize = options.batchSize ?? 1000;
-    this.storage = options.storage ?? new InMemoryStorage();
+  constructor(options: RecommendationOptions = {}) {
+    this.epoch = positiveInteger(options.epoch ?? 20, 'epoch');
+    this.embeddingSize = positiveInteger(options.embeddingSize ?? 16, 'embeddingSize');
+    this.batchSize = positiveInteger(options.batchSize ?? 256, 'batchSize');
+    this.learningRate = options.learningRate ?? 0.01;
+    this.regularization = options.regularization ?? 0.0001;
+    this.negativeSamples = options.negativeSamples ?? 2;
+    this.feedback = options.feedback ?? 'explicit';
 
-    if (!tf) tf = loadTensorflow();
-
-    if ('disableIsNode' in options) {
-      tf.ENV.set('IS_NODE', !options.disableIsNode);
+    if (!Number.isFinite(this.learningRate) || this.learningRate <= 0 ||
+      !Number.isFinite(this.regularization) || this.regularization < 0 ||
+      !Number.isSafeInteger(this.negativeSamples) || this.negativeSamples < 0 ||
+      (this.feedback !== 'explicit' && this.feedback !== 'implicit')) {
+      throw new RangeError('Invalid learningRate, regularization, negativeSamples, or feedback');
     }
 
+    this.storage = options.storage ?? new InMemoryStorage();
+    if (!tf) tf = loadTensorflow();
+    // Do not mutate tf.ENV: it is process-global, and IS_NODE is not a warning toggle.
     this.optimizer = tf.train.adam(this.learningRate);
   }
 
-  public get initialized(): boolean {
+  get initialized(): boolean {
     return this._initialized;
   }
 
-  /**
-   * Initializes the user and entity embedding matrices with random values in batches.
-   * Called automatically when fitting data for the first time.
-   * @private
-   */
-  private async initializeEmbeddings() {
-    const numUsers = (await this.storage.getAllUsers()).length;
-    const numEntities = (await this.storage.getAllEntities()).length;
-
-    // Initialize embeddings in chunks to reduce memory usage
-    this.userEmbeddings = await this.createEmbeddingsInBatches(
-      numUsers,
-      this.embeddingSize
-    );
-    this.entityEmbeddings = await this.createEmbeddingsInBatches(
-      numEntities,
-      this.embeddingSize
-    );
-    this._initialized = true;
+  /** Queue all operations, including reads, to prevent disposal/resizing races. */
+  private run<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new Error('Recommendation has been disposed'));
+    const result = this.operations.then(operation);
+    this.operations = result.then(() => undefined, () => undefined);
+    return result;
   }
 
-  /**
-   * Creates embedding matrices in batches to reduce memory consumption.
-   * @param totalSize - Total number of embeddings to create
-   * @param embeddingDim - Dimension of each embedding vector
-   * @returns Promise resolving to the created embedding variable
-   * @private
-   */
-  private async createEmbeddingsInBatches(
-    totalSize: number,
-    embeddingDim: number
-  ): Promise<tensorflow.Variable> {
-    if (totalSize === 0) {
-      return tf.variable(tf.zeros([0, embeddingDim]));
+  private makeEmbeddings(rows: number): tensorflow.Variable {
+    const initial = tf.randomNormal([rows, this.embeddingSize], 0, 0.25);
+    try {
+      return tf.variable(initial);
+    } finally {
+      initial.dispose();
     }
-
-    const batches: tensorflow.Tensor[] = [];
-    const batchSize = Math.min(this.batchSize, totalSize);
-
-    for (let i = 0; i < totalSize; i += batchSize) {
-      const currentBatchSize = Math.min(batchSize, totalSize - i);
-      const batch = tf.randomNormal([currentBatchSize, embeddingDim]);
-      batches.push(batch);
-
-      // Add a small delay to prevent blocking the event loop
-      if (batches.length % 10 === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-    }
-
-    const fullMatrix = tf.concat(batches, 0);
-
-    // Clean up intermediate tensors
-    batches.forEach((batch) => batch.dispose());
-
-    return tf.variable(fullMatrix);
   }
 
-  /**
-   * Trains the recommendation model on the provided interaction data.
-   * Uses matrix factorization to learn user and entity embeddings.
-   * Processes data in batches to reduce memory usage.
-   * @param data - Array of user-entity interactions with optional ratings
-   * @returns Promise that resolves when training is complete
-   */
-  async fit(data: Interaction[] = []) {
-    if (!data.length) return;
-
-    // Process user and entity registration in batches
-    await this.registerUsersAndEntitiesInBatches(data);
+  private async initializeOrResize(): Promise<void> {
+    const users = (await this.storage.getAllUsers()).length;
+    const entities = (await this.storage.getAllEntities()).length;
 
     if (!this._initialized) {
-      await this.initializeEmbeddings();
-    } else {
-      // Handle embedding resizing for new users/entities
-      await this.resizeEmbeddingsIfNeeded();
+      this.userEmbeddings = this.makeEmbeddings(users);
+      this.entityEmbeddings = this.makeEmbeddings(entities);
+      this._initialized = true;
+      return;
     }
 
-    // Train in batches for each epoch
-    for (let e = 0; e < this.epoch; e++) {
-      await this.trainEpochInBatches(data);
+    let resized = false;
+    if (users > this.userEmbeddings.shape[0]) {
+      const more = this.makeEmbeddings(users - this.userEmbeddings.shape[0]);
+      const combined = tf.tidy(() => tf.concat([this.userEmbeddings, more], 0));
+      more.dispose();
+      const next = tf.variable(combined);
+      combined.dispose();
+      this.userEmbeddings.dispose();
+      this.userEmbeddings = next;
+      resized = true;
     }
-  }
-
-  /**
-   * Registers users and entities from interaction data in batches.
-   * @param data - Array of user-entity interactions
-   * @private
-   */
-  private async registerUsersAndEntitiesInBatches(data: Interaction[]) {
-    for (let i = 0; i < data.length; i += this.batchSize) {
-      const batch = data.slice(i, i + this.batchSize);
-
-      for (const { user, entity } of batch) {
-        await this.storage.getOrCreateUserIndex(user);
-        await this.storage.getOrCreateEntityIndex(entity);
-      }
-
-      // Add a small delay to prevent blocking the event loop
-      if (i > 0 && i % (this.batchSize * 10) === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-    }
-  }
-
-  /**
-   * Resizes embeddings if new users or entities have been added.
-   * @private
-   */
-  private async resizeEmbeddingsIfNeeded() {
-    const userCount = (await this.storage.getAllUsers()).length;
-    const entityCount = (await this.storage.getAllEntities()).length;
-
-    if (userCount > this.userEmbeddings.shape[0]) {
-      const newUserCount = userCount - this.userEmbeddings.shape[0];
-      const newUsers = await this.createEmbeddingsInBatches(
-        newUserCount,
-        this.embeddingSize
-      );
-      const oldUserEmbeddings = this.userEmbeddings;
-      this.userEmbeddings = tf.variable(
-        tf.concat([oldUserEmbeddings, newUsers], 0)
-      );
-      oldUserEmbeddings.dispose();
-      newUsers.dispose();
+    if (entities > this.entityEmbeddings.shape[0]) {
+      const more = this.makeEmbeddings(entities - this.entityEmbeddings.shape[0]);
+      const combined = tf.tidy(() => tf.concat([this.entityEmbeddings, more], 0));
+      more.dispose();
+      const next = tf.variable(combined);
+      combined.dispose();
+      this.entityEmbeddings.dispose();
+      this.entityEmbeddings = next;
+      resized = true;
     }
 
-    if (entityCount > this.entityEmbeddings.shape[0]) {
-      const newEntityCount = entityCount - this.entityEmbeddings.shape[0];
-      const newEntities = await this.createEmbeddingsInBatches(
-        newEntityCount,
-        this.embeddingSize
-      );
-      const oldEntityEmbeddings = this.entityEmbeddings;
-      this.entityEmbeddings = tf.variable(
-        tf.concat([oldEntityEmbeddings, newEntities], 0)
-      );
-      oldEntityEmbeddings.dispose();
-      newEntities.dispose();
+    if (resized) {
+      // Adam's slots belong to the old variables, so they must be rebuilt.
+      this.optimizer.dispose();
+      this.optimizer = tf.train.adam(this.learningRate);
     }
   }
 
-  /**
-   * Trains one epoch of the model using batch processing.
-   * @param data - Array of user-entity interactions
-   * @private
-   */
-  private async trainEpochInBatches(data: Interaction[]) {
-    for (let i = 0; i < data.length; i += this.batchSize) {
-      const batch = data.slice(i, i + this.batchSize);
+  async fit(data: Interaction[] = []): Promise<void> {
+    return this.run(() => this.fitInternal(data));
+  }
 
-      for (const { user, entity, rating } of batch) {
-        const userIdx = await this.storage.getUserIndex(user);
-        const entityIdx = await this.storage.getEntityIndex(entity);
-        if (userIdx == null || entityIdx == null) continue;
+  private async fitInternal(data: Interaction[]): Promise<void> {
+    if (!Array.isArray(data)) throw new TypeError('Interactions must be an array');
+    if (data.length === 0) return;
 
-        await this.optimizer.minimize(() => {
-          const userVec = this.userEmbeddings.slice(
-            [userIdx, 0],
-            [1, this.embeddingSize]
-          );
-          const entityVec = this.entityEmbeddings.slice(
-            [entityIdx, 0],
-            [1, this.embeddingSize]
-          );
-          const pred = tf.sum(tf.mul(userVec, entityVec));
-          const target = tf.scalar(rating ?? 1);
-          return tf.losses.meanSquaredError(target, pred);
-        }, true);
+    for (const interaction of data) {
+      if (!interaction || !validId(interaction.user) || !validId(interaction.entity) ||
+        !Number.isFinite(interaction.rating ?? 1)) {
+        throw new TypeError('Each interaction needs valid user, entity, and finite rating');
       }
-
-      // Add a small delay every few batches to prevent blocking the event loop
-      if (i > 0 && i % (this.batchSize * 5) === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
+      if (this.feedback === 'implicit' && interaction.rating !== undefined &&
+        interaction.rating !== 0 && interaction.rating !== 1) {
+        throw new RangeError('Implicit feedback ratings must be 0 or 1');
       }
     }
+
+    for (const { user, entity } of data) {
+      await this.storage.getOrCreateUserIndex(user);
+      await this.storage.getOrCreateEntityIndex(entity);
+    }
+    await this.initializeOrResize();
+
+    // Record observations before negative sampling so positive events in this call
+    // cannot accidentally be selected as negative examples.
+    for (const { user, entity, rating } of data) {
+      let observed = this.history.get(user);
+      if (!observed) {
+        observed = new Map();
+        this.history.set(user, observed);
+      }
+      observed.set(entity, rating ?? 1);
+    }
+
+    const allEntities = this.feedback === 'implicit' ? await this.storage.getAllEntities() : [];
+    const order = data.map((_, index) => index);
+
+    for (let epoch = 0; epoch < this.epoch; epoch++) {
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+
+      for (let start = 0; start < order.length; start += this.batchSize) {
+        const userIndices: number[] = [];
+        const entityIndices: number[] = [];
+        const targets: number[] = [];
+        const end = Math.min(start + this.batchSize, order.length);
+
+        for (let i = start; i < end; i++) {
+          const interaction = data[order[i]];
+          const userIndex = await this.storage.getUserIndex(interaction.user);
+          const entityIndex = await this.storage.getEntityIndex(interaction.entity);
+          if (userIndex == null || entityIndex == null) throw new Error('Storage mapping changed during training');
+
+          const rating = interaction.rating ?? 1;
+          userIndices.push(userIndex);
+          entityIndices.push(entityIndex);
+          targets.push(rating);
+
+          if (this.feedback === 'implicit' && rating === 1 && this.negativeSamples > 0) {
+            const observed = this.history.get(interaction.user)!;
+            if (observed.size >= allEntities.length) continue;
+            for (let n = 0; n < this.negativeSamples; n++) {
+              let candidate = Math.floor(Math.random() * allEntities.length);
+              let tries = 0;
+              while (observed.has(allEntities[candidate]) && tries++ < 16) {
+                candidate = Math.floor(Math.random() * allEntities.length);
+              }
+              if (observed.has(allEntities[candidate])) {
+                const first = candidate;
+                do {
+                  candidate = (candidate + 1) % allEntities.length;
+                } while (candidate !== first && observed.has(allEntities[candidate]));
+                if (observed.has(allEntities[candidate])) break;
+              }
+              userIndices.push(userIndex);
+              entityIndices.push(candidate);
+              targets.push(0);
+            }
+          }
+        }
+
+        const userTensor = tf.tensor1d(userIndices, 'int32');
+        const entityTensor = tf.tensor1d(entityIndices, 'int32');
+        const targetsTensor = tf.tensor1d(targets);
+        try {
+          this.optimizer.minimize(() => tf.tidy(() => {
+            const users = tf.gather(this.userEmbeddings, userTensor);
+            const entities = tf.gather(this.entityEmbeddings, entityTensor);
+            const predictions = tf.sum(tf.mul(users, entities), 1);
+            const error = this.feedback === 'explicit'
+              ? tf.mean(tf.square(tf.sub(predictions, targetsTensor)))
+              : tf.mean(tf.softplus(tf.mul(predictions, tf.sub(1, tf.mul(targetsTensor, 2)))));
+            if (this.regularization === 0) return error;
+            const penalty = tf.mul(this.regularization, tf.add(
+              tf.mean(tf.square(users)),
+              tf.mean(tf.square(entities))
+            ));
+            return tf.add(error, penalty);
+          }), false, [this.userEmbeddings, this.entityEmbeddings]);
+        } finally {
+          userTensor.dispose();
+          entityTensor.dispose();
+          targetsTensor.dispose();
+        }
+
+        // Yield periodically; fit() is async but the TensorFlow CPU backend is synchronous.
+        if (start > 0 && start % (this.batchSize * 10) === 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+    }
   }
 
-  /**
-   * Gets the top users most likely to interact with a given entity.
-   * @param entity - The entity ID to find users for
-   * @param count - Maximum number of users to return (default: 10)
-   * @returns Promise resolving to an array of user IDs ranked by likelihood
-   */
-  async getUsers(entity: Id, count = 10): Promise<Id[]> {
-    const entityIdx = await this.storage.getEntityIndex(entity);
-    if (entityIdx == null) return [];
-
-    const entityVec = this.entityEmbeddings.slice(
-      [entityIdx, 0],
-      [1, this.embeddingSize]
-    );
-    const scores = tf
-      .matMul(this.userEmbeddings, entityVec.transpose())
-      .reshape([-1]);
-    const values = (await scores.array()) as number[];
-    const userIds = await this.storage.getAllUsers();
-
-    return this.rankTop(values, userIds, count);
+  private async scoreAll(matrix: tensorflow.Variable, index: number, other: tensorflow.Variable): Promise<number[]> {
+    const scores = tf.tidy(() => {
+      const selected = tf.gather(matrix, tf.tensor1d([index], 'int32'));
+      return tf.matMul(other, selected, false, true).reshape([-1]);
+    });
+    try {
+      const values = Array.from(await scores.data());
+      return this.feedback === 'implicit'
+        ? values.map((score) => 1 / (1 + Math.exp(-score)))
+        : values;
+    } finally {
+      scores.dispose();
+    }
   }
 
-  /**
-   * Gets the top entities most likely to be of interest to a given user.
-   * @param user - The user ID to find recommendations for
-   * @param count - Maximum number of entities to return (default: 10)
-   * @returns Promise resolving to an array of entity IDs ranked by likelihood
-   */
-  async getEntities(user: Id, count = 10): Promise<Id[]> {
-    const userIdx = await this.storage.getUserIndex(user);
-    if (userIdx == null) return [];
-
-    const userVec = this.userEmbeddings.slice(
-      [userIdx, 0],
-      [1, this.embeddingSize]
-    );
-    const scores = tf
-      .matMul(this.entityEmbeddings, userVec.transpose())
-      .reshape([-1]);
-    const values = (await scores.array()) as number[];
-    const entityIds = await this.storage.getAllEntities();
-
-    return this.rankTop(values, entityIds, count);
-  }
-
-  /**
-   * Ranks and returns the top items based on their scores.
-   * @param scores - Array of numerical scores
-   * @param ids - Array of corresponding IDs
-   * @param count - Number of top items to return
-   * @returns Array of top-ranked IDs
-   * @private
-   */
-  private rankTop(scores: number[], ids: Id[], count: number): Id[] {
-    return scores
-      .map((score, idx) => ({ id: ids[idx], score }))
+  private top(scores: number[], ids: Id[], count: number, ignored: Set<Id>): Id[] {
+    return ids
+      .map((id, index) => ({ id, score: scores[index] }))
+      .filter((entry) => !ignored.has(entry.id) && Number.isFinite(entry.score))
       .sort((a, b) => b.score - a.score)
       .slice(0, count)
       .map((entry) => entry.id);
   }
 
-  /**
-   * Exports the trained model as a JSON-serializable object.
-   * @returns Promise resolving to the serialized model data
-   */
-  async export(): Promise<SerializedModel> {
-    if (!this._initialized) {
-      throw new Error(
-        'Model must be initialized before export. Call fit() first.'
-      );
+  private popular(count: number, ignored: Set<Id>): Id[] {
+    const scores = new Map<Id, { count: number; total: number }>();
+    for (const seen of this.history.values()) {
+      for (const [entity, rating] of seen) {
+        const current = scores.get(entity) ?? { count: 0, total: 0 };
+        current.count++;
+        current.total += rating;
+        scores.set(entity, current);
+      }
     }
+    return Array.from(scores)
+      .filter(([id]) => !ignored.has(id))
+      .sort((a, b) => b[1].count - a[1].count ||
+        b[1].total / b[1].count - a[1].total / a[1].count)
+      .slice(0, count)
+      .map(([id]) => id);
+  }
 
-    const storageData = await this.storage.exportData();
-    const userEmbeddingsArray =
-      (await this.userEmbeddings.array()) as number[][];
-    const entityEmbeddingsArray =
-      (await this.entityEmbeddings.array()) as number[][];
+  async getEntities(user: Id, count = 10, options: RecommendationQueryOptions = {}): Promise<Id[]> {
+    return this.run(async () => {
+      if (!Number.isSafeInteger(count) || count < 0) throw new RangeError('count must be nonnegative');
+      if (count === 0 || !this._initialized) return [];
+      const ignored = new Set(options.exclude ?? []);
+      if (options.excludeSeen !== false) {
+        for (const id of this.history.get(user)?.keys() ?? []) ignored.add(id);
+      }
+      const index = await this.storage.getUserIndex(user);
+      if (index == null) return options.coldStart === 'empty' ? [] : this.popular(count, ignored);
+      return this.top(await this.scoreAll(this.userEmbeddings, index, this.entityEmbeddings),
+        await this.storage.getAllEntities(), count, ignored);
+    });
+  }
 
+  async getUsers(entity: Id, count = 10, options: RecommendationQueryOptions = {}): Promise<Id[]> {
+    return this.run(async () => {
+      if (!Number.isSafeInteger(count) || count < 0) throw new RangeError('count must be nonnegative');
+      if (count === 0 || !this._initialized) return [];
+      const index = await this.storage.getEntityIndex(entity);
+      if (index == null) return [];
+      const ignored = new Set(options.exclude ?? []);
+      if (options.excludeSeen) {
+        for (const [user, seen] of this.history) {
+          if (seen.has(entity)) ignored.add(user);
+        }
+      }
+      return this.top(await this.scoreAll(this.entityEmbeddings, index, this.userEmbeddings),
+        await this.storage.getAllUsers(), count, ignored);
+    });
+  }
+
+  /** Predict an explicit rating or an implicit interaction probability. */
+  async predict(user: Id, entity: Id): Promise<number | null> {
+    return this.run(async () => {
+      if (!this._initialized) return null;
+      const userIndex = await this.storage.getUserIndex(user);
+      const entityIndex = await this.storage.getEntityIndex(entity);
+      if (userIndex == null || entityIndex == null) return null;
+      const scores = await this.scoreAll(this.userEmbeddings, userIndex, this.entityEmbeddings);
+      return scores[entityIndex] ?? null;
+    });
+  }
+
+  private async exportInternal(): Promise<SerializedModel> {
+    if (!this._initialized) throw new Error('Call fit() before exporting');
+    const mapping = await this.storage.exportData();
+    const interactions: Array<[Id, Id, number]> = [];
+    for (const [user, entities] of this.history) {
+      for (const [entity, rating] of entities) interactions.push([user, entity, rating]);
+    }
     return {
       config: {
-        epoch: this.epoch,
-        embeddingSize: this.embeddingSize,
-        learningRate: this.learningRate,
-        batchSize: this.batchSize,
+        epoch: this.epoch, embeddingSize: this.embeddingSize,
+        learningRate: this.learningRate, batchSize: this.batchSize,
+        regularization: this.regularization, feedback: this.feedback,
+        negativeSamples: this.negativeSamples,
       },
-      userEmbeddings: userEmbeddingsArray,
-      entityEmbeddings: entityEmbeddingsArray,
-      userMap: storageData.userMap,
-      entityMap: storageData.entityMap,
-      reverseUserMap: storageData.reverseUserMap,
-      reverseEntityMap: storageData.reverseEntityMap,
-      initialized: this._initialized,
-      version: '1.0.0',
+      userEmbeddings: await this.userEmbeddings.array() as number[][],
+      entityEmbeddings: await this.entityEmbeddings.array() as number[][],
+      ...mapping,
+      interactions,
+      initialized: true,
+      version: '2.0.0',
     };
   }
 
-  /**
-   * Saves the trained model to a JSON file.
-   * Note: This method requires Node.js environment with file system access.
-   * @param filePath - Path where to save the model file
-   * @returns Promise that resolves when the file is saved
-   */
+  async export(): Promise<SerializedModel> {
+    return this.run(() => this.exportInternal());
+  }
+
+  /** Write a complete snapshot to a temporary file, then atomically rename it. */
   async save(filePath: string): Promise<void> {
-    // Dynamic import to handle environments without fs module
+    return this.run(async () => {
+      const fs = await import('node:fs/promises');
+      const path = await import('node:path');
+      const crypto = await import('node:crypto');
+      const snapshot = await this.exportInternal();
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const temporary = filePath + '.' + crypto.randomUUID() + '.tmp';
+      try {
+        await fs.writeFile(temporary, JSON.stringify(snapshot), { encoding: 'utf8', flag: 'wx' });
+        await fs.rename(temporary, filePath);
+      } finally {
+        await fs.rm(temporary, { force: true });
+      }
+    });
+  }
+
+  static async from(model: SerializedModel, storage?: StorageStrategy): Promise<Recommendation> {
+    if (!model || !model.config || !Array.isArray(model.reverseUserMap) ||
+      !Array.isArray(model.reverseEntityMap) || !Array.isArray(model.userMap) ||
+      !Array.isArray(model.entityMap) || model.initialized !== true ||
+      (model.version !== '1.0.0' && model.version !== '2.0.0')) {
+      throw new Error('Invalid or unsupported serialized model');
+    }
+    const recommendation = new Recommendation({ ...model.config, storage });
     try {
-      const fs = await import('fs');
-      const path = await import('path');
+      validateMatrix(model.userEmbeddings, model.reverseUserMap.length,
+        recommendation.embeddingSize, 'user embeddings');
+      validateMatrix(model.entityEmbeddings, model.reverseEntityMap.length,
+        recommendation.embeddingSize, 'entity embeddings');
 
-      const modelData = await this.export();
-      const jsonString = JSON.stringify(modelData);
-
-      // Ensure directory exists
-      const dir = path.dirname(filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      if (model.userMap.length !== model.reverseUserMap.length ||
+        model.entityMap.length !== model.reverseEntityMap.length ||
+        model.userMap.some(([id, index]) => !validId(id) ||
+          !Number.isSafeInteger(index) || model.reverseUserMap[index] !== id) ||
+        model.entityMap.some(([id, index]) => !validId(id) ||
+          !Number.isSafeInteger(index) || model.reverseEntityMap[index] !== id)) {
+        throw new Error('Invalid ID mappings in serialized model');
       }
 
-      fs.writeFileSync(filePath, jsonString, 'utf8');
+      await recommendation.storage.importData({
+        userMap: model.userMap, entityMap: model.entityMap,
+        reverseUserMap: model.reverseUserMap, reverseEntityMap: model.reverseEntityMap,
+      });
+
+      const users = tf.tensor2d(model.userEmbeddings,
+        [model.reverseUserMap.length, recommendation.embeddingSize]);
+      const entities = tf.tensor2d(model.entityEmbeddings,
+        [model.reverseEntityMap.length, recommendation.embeddingSize]);
+      try {
+        recommendation.userEmbeddings = tf.variable(users);
+        recommendation.entityEmbeddings = tf.variable(entities);
+      } finally {
+        users.dispose();
+        entities.dispose();
+      }
+      recommendation._initialized = true;
+
+      if (model.interactions !== undefined) {
+        if (!Array.isArray(model.interactions)) throw new Error('Invalid interaction history');
+        for (const entry of model.interactions) {
+          if (!Array.isArray(entry) || entry.length !== 3 ||
+            !validId(entry[0]) || !validId(entry[1]) ||
+            typeof entry[2] !== 'number' || !Number.isFinite(entry[2])) {
+            throw new Error('Invalid interaction history entry');
+          }
+          let seen = recommendation.history.get(entry[0]);
+          if (!seen) {
+            seen = new Map();
+            recommendation.history.set(entry[0], seen);
+          }
+          seen.set(entry[1], entry[2]);
+        }
+      }
+      return recommendation;
     } catch (error) {
-      throw new Error(
-        `Failed to save model: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }. Make sure you're running in a Node.js environment.`
-      );
+      await recommendation.dispose();
+      throw error;
     }
   }
 
-  /**
-   * Creates a new Recommendation instance from a serialized model.
-   * @param modelData - The serialized model data
-   * @param storage - Optional custom storage strategy (defaults to InMemoryStorage)
-   * @returns Promise resolving to a new Recommendation instance
-   */
-  static async from(
-    modelData: SerializedModel,
-    storage?: StorageStrategy
-  ): Promise<Recommendation> {
-    // Validate version compatibility
-    if (modelData.version !== '1.0.0') {
-      console.warn(
-        `Loading model with version ${modelData.version}, expected 1.0.0. Some features may not work correctly.`
-      );
-    }
-
-    const recommendation = new Recommendation({
-      ...modelData.config,
-      storage: storage ?? new InMemoryStorage(),
-    });
-
-    // Import storage data
-    await recommendation.storage.importData({
-      userMap: modelData.userMap,
-      entityMap: modelData.entityMap,
-      reverseUserMap: modelData.reverseUserMap,
-      reverseEntityMap: modelData.reverseEntityMap,
-    });
-
-    // Restore embeddings
-    recommendation.userEmbeddings = tf.variable(
-      tf.tensor2d(modelData.userEmbeddings)
-    );
-    recommendation.entityEmbeddings = tf.variable(
-      tf.tensor2d(modelData.entityEmbeddings)
-    );
-    recommendation._initialized = modelData.initialized;
-
-    return recommendation;
+  static async fromPath(filePath: string, storage?: StorageStrategy): Promise<Recommendation> {
+    const fs = await import('node:fs/promises');
+    const text = await fs.readFile(filePath, 'utf8');
+    return Recommendation.from(JSON.parse(text) as SerializedModel, storage);
   }
 
-  /**
-   * Creates a new Recommendation instance from a saved model file.
-   * Note: This method requires Node.js environment with file system access.
-   * @param filePath - Path to the saved model file
-   * @param storage - Optional custom storage strategy (defaults to InMemoryStorage)
-   * @returns Promise resolving to a new Recommendation instance
-   */
-  static async fromPath(
-    filePath: string,
-    storage?: StorageStrategy
-  ): Promise<Recommendation> {
-    try {
-      const fs = await import('fs');
-
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`Model file not found: ${filePath}`);
+  /** Release variables, optimizer slots, and any future tensor state. */
+  async dispose(): Promise<void> {
+    if (this.closed) return this.operations;
+    this.closed = true;
+    const result = this.operations.then(() => {
+      if (this._initialized) {
+        this.userEmbeddings?.dispose();
+        this.entityEmbeddings?.dispose();
       }
-
-      const jsonString = fs.readFileSync(filePath, 'utf8');
-      const modelData: SerializedModel = JSON.parse(jsonString);
-
-      return this.from(modelData, storage);
-    } catch (error) {
-      throw new Error(
-        `Failed to load model: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }. Make sure you're running in a Node.js environment and the file exists.`
-      );
-    }
+      this.optimizer.dispose();
+      this._initialized = false;
+      this.history.clear();
+    });
+    this.operations = result.then(() => undefined, () => undefined);
+    return result;
   }
 }
