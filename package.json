@@ -7,7 +7,9 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test tests/*.test.cjs"
+    "test": "pnpm run build && node --test tests/*.test.cjs .github/scripts/*.test.mjs",
+    "test:release": "node --test .github/scripts/*.test.mjs",
+    "example": "tsx examples/index.ts"
   },
   "files": [
     "dist",
@@ -27,12 +29,17 @@
     "type": "git",
     "url": "https://github.com/twlite/recommendtf.git"
   },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.16.1",
   "peerDependencies": {
     "@tensorflow/tfjs": "^4.22.0"
   },
   "devDependencies": {
     "@tensorflow/tfjs": "^4.22.0",
     "@types/node": "^22.15.21",
+    "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }
 }

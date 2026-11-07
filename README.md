@@ -96,6 +96,24 @@ Resizing embeddings retains learned values but resets Adam's optimizer state. Sa
 
 Methods: `fit(interactions)`, `getEntities(user, count?, options?)`, `getUsers(item, count?, options?)`, `predict(user, item)`, `export()`, `save(path)`, `Recommendation.from(snapshot, storage?)`, `Recommendation.fromPath(path, storage?)`, `dispose()`.
 
-Run `npm test` to compile and execute the Node.js test suite.
+Run `pnpm install --frozen-lockfile && pnpm test` to compile and execute the Node.js test suite.
 
 MIT licensed.
+
+## Maintainer release workflow
+
+This repository uses pnpm for dependency installation, builds and tests. CI caches pnpm's content-addressable store, while `pnpm install --frozen-lockfile` rejects unsynchronized dependencies.
+
+To release, push a commit to `main` whose **subject** is one of:
+
+```
+chore: release 0.2.0
+chore: release 0.2.0-rc.1
+chore: release 0.2.0-beta.1
+```
+
+The workflow runs tests on Node 20, 22 and 24, applies the release version without editing or committing the lockfile, builds and packs a verified tarball, then publishes through **npm trusted publishing over GitHub OIDC**. Already published exact versions are skipped, so rerunning a partial release is safe. A single GitHub release is created after npm publishing succeeds. Stable releases use the `latest` npm tag, while prereleases use their channel (for example `rc`).
+
+**One-time npm setup:** An npm package owner must configure `recommendtf` under npm's **Trusted Publishers** settings with GitHub organization/user `twlite`, repository `recommendtf`, and workflow file `ci.yml` (the optional environment field is empty). This is required for publishing; the GitHub workflow intentionally does not use `NPM_TOKEN` or an npm auth token. The publish job grants `id-token: write` only where needed.
+
+Only release commits originating from the repository owner account on `main` initiate publishing. Reruns must also be started by the owner. Do not use `chore: release ...` in unrelated commit subjects.
